@@ -1,0 +1,313 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import os
+import sys
+import threading
+import subprocess
+import winreg as reg
+import time
+from PIL import Image, ImageTk, ImageDraw
+
+# =================================================================
+# MP5 EXE VE YOL YAPILANDIRMASI
+# =================================================================
+
+def get_resource_path(relative_path):
+    """ EXE yapıldığında iç kaynaklara, normalde dosya sistemine erişir. """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+def generate_mp5_assets():
+    """Uygulamanın görsel kimliğini (PNG ve ICO) otonom olarak oluşturur."""
+    png_path = os.path.abspath("mp5.png")
+    ico_path = os.path.abspath("mp5.ico")
+    
+    try:
+        img = Image.new('RGBA', (512, 512), color=(10, 10, 10, 255))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse([50, 50, 462, 462], outline=(0, 173, 181), width=25)
+        draw.rectangle([200, 150, 240, 362], fill=(0, 173, 181))
+        draw.polygon([(240, 150), (312, 250), (384, 150)], fill=(0, 173, 181))
+        
+        img.save(png_path)
+        sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+        img.save(ico_path, format='ICO', sizes=sizes)
+        return ico_path
+    except Exception as e:
+        print(f"Varlık hatası: {e}")
+        return None
+
+def setup_registry_defaults(ico_path):
+    """Windows'a .mp5 formatını ve ikonunu mühürler."""
+    try:
+        app_name = "MP5.Studio.Pro"
+        if getattr(sys, 'frozen', False):
+            exe_path = f'"{sys.executable}"'
+        else:
+            exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
+        with reg.CreateKey(reg.HKEY_CURRENT_USER, r"Software\Classes\.mp5") as key:
+            reg.SetValue(key, "", reg.REG_SZ, app_name)
+
+        with reg.CreateKey(reg.HKEY_CURRENT_USER, f"Software\\Classes\\{app_name}") as key:
+            reg.SetValue(key, "", reg.REG_SZ, "MP5 Video Dosyası")
+            with reg.CreateKey(key, "DefaultIcon") as i_key:
+                reg.SetValue(i_key, "", reg.REG_SZ, f'"{ico_path}"')
+            with reg.CreateKey(key, r"shell\open\command") as c_key:
+                reg.SetValue(c_key, "", reg.REG_SZ, f'{exe_path} "%1"')
+        
+        subprocess.run(["ie4uinit.exe", "-show"], capture_output=True)
+        return True
+    except:
+        return False
+
+def check_libs():
+    libs = {"cv2": "opencv-python", "PIL": "pillow", "moviepy": "moviepy", "vlc": "python-vlc"}
+    missing = []
+    for mod, pkg in libs.items():
+        try: __import__(mod)
+        except ImportError: missing.append(pkg)
+    
+    if missing and not getattr(sys, 'frozen', False):
+        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+        os.execv(sys.executable, ['python'] + sys.argv)
+    return True
+
+# =================================================================
+# ANA UYGULAMA
+# =================================================================
+
+class MP5StudioPro:
+    def __init__(self, root, target_file=None):
+        self.root = root
+        self.root.title("MP5 Studio Pro")
+        self.root.geometry("1100x750")
+        self.root.configure(bg="#0a0a0a")
+        
+        self.v_path = None
+        self.a_path = None
+        self.vlc_player = None
+        self.is_paused = False
+
+        self.ico_full_path = generate_mp5_assets()
+        if self.ico_full_path: 
+            setup_registry_defaults(self.ico_full_path)
+        
+        self.setup_ui()
+
+        self.container = tk.Frame(self.root, bg="#0a0a0a")
+        self.container.pack(fill="both", expand=True)
+
+        if target_file and os.path.exists(target_file):
+            self.root.after(200, lambda: self.play_mp5(target_file))
+        else:
+            self.show_editor()
+
+    def setup_ui(self):
+        try:
+            icon_path = os.path.abspath("mp5.png")
+            if os.path.exists(icon_path):
+                self.icon_img = ImageTk.PhotoImage(Image.open(icon_path))
+                self.root.iconphoto(True, self.icon_img)
+        except: pass
+        
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("Treeview", background="#151515", foreground="white", fieldbackground="#151515", borderwidth=0)
+
+    def show_editor(self):
+        for w in self.container.winfo_children(): w.destroy()
+
+        left = tk.Frame(self.container, bg="#111", width=250)
+        left.pack(side="left", fill="y", padx=2, pady=2)
+        
+        tk.Label(left, text="DOSYALARIN", fg="#00adb5", bg="#111", font=("Arial", 10, "bold")).pack(pady=10)
+        self.tree = ttk.Treeview(left, show="tree")
+        self.tree.pack(fill="both", expand=True, padx=5, pady=5)
+        self.tree.bind("<<TreeviewOpen>>", self.expand_tree)
+        self.tree.bind("<Double-1>", self.on_double_click)
+        self.load_path(os.path.expanduser("~\\Videos"))
+
+        right = tk.Frame(self.container, bg="#0a0a0a")
+        right.pack(side="right", fill="both", expand=True)
+
+        tk.Label(right, text="MP5 STUDIO", font=("Impact", 50), fg="#00adb5", bg="#0a0a0a").pack(pady=40)
+
+        box = tk.Frame(right, bg="#111", padx=40, pady=40)
+        box.pack(fill="x", padx=50)
+
+        self.v_lbl = self.row(box, "VİDEO SEÇ:", self.pick_v)
+        self.a_lbl = self.row(box, "SES SEÇ:", self.pick_a)
+
+        self.seal_btn = tk.Button(right, text="MP5 MÜHÜRLE", font=("Arial", 14, "bold"), bg="#00adb5", 
+                  fg="white", padx=40, pady=15, command=self.save_mp5)
+        self.seal_btn.pack(pady=40)
+
+    def row(self, p, txt, cmd):
+        f = tk.Frame(p, bg="#111", pady=10)
+        f.pack(fill="x")
+        tk.Label(f, text=txt, fg="#00adb5", bg="#111", font=("Arial", 9, "bold"), width=15, anchor="w").pack(side="left")
+        l = tk.Label(f, text="Boş...", fg="#666", bg="#1a1a1a", anchor="w", padx=10)
+        l.pack(side="left", fill="x", expand=True, padx=10, ipady=5)
+        tk.Button(f, text="SEÇ", bg="#333", fg="white", command=cmd).pack(side="right")
+        return l
+
+    def load_path(self, p, node=""):
+        try:
+            for i in os.listdir(p):
+                full = os.path.join(p, i)
+                isdir = os.path.isdir(full)
+                n = self.tree.insert(node, "end", text=i, values=(full, isdir))
+                if isdir: self.tree.insert(n, "end")
+        except: pass
+
+    def expand_tree(self, e):
+        n = self.tree.focus()
+        p = self.tree.item(n, "values")[0]
+        self.tree.delete(*self.tree.get_children(n))
+        self.load_path(p, n)
+
+    def on_double_click(self, e):
+        n = self.tree.focus()
+        p, isdir = self.tree.item(n, "values")
+        if isdir == "True": return
+        if p.lower().endswith((".mp4", ".avi", ".mkv")): 
+            self.v_path = p
+            self.v_lbl.config(text=os.path.basename(p), fg="white")
+        elif p.lower().endswith((".mp3", ".wav", ".ogg")): 
+            self.a_path = p
+            self.a_lbl.config(text=os.path.basename(p), fg="white")
+        elif p.lower().endswith(".mp5"): 
+            self.play_mp5(p)
+
+    def pick_v(self):
+        p = filedialog.askopenfilename(title="Video Seç", filetypes=[("Video", "*.mp4 *.avi *.mkv"), ("Hepsi", "*.*")])
+        if p: self.v_path = p; self.v_lbl.config(text=os.path.basename(p), fg="white")
+
+    def pick_a(self):
+        p = filedialog.askopenfilename(title="Ses Seç", filetypes=[("Ses", "*.mp3 *.wav *.ogg"), ("Hepsi", "*.*")])
+        if p: self.a_path = p; self.a_lbl.config(text=os.path.basename(p), fg="white")
+
+    def save_mp5(self):
+        if not self.v_path or not self.a_path: 
+            messagebox.showwarning("Hata", "Video ve Ses seçmelisin!")
+            return
+        out = filedialog.asksaveasfilename(defaultextension=".mp5", filetypes=[("MP5", "*.mp5")])
+        if out: 
+            self.seal_btn.config(state="disabled", text="MÜHÜRLENİYOR...")
+            threading.Thread(target=self.make_engine_with_cmd, args=(out,), daemon=True).start()
+
+    def make_engine_with_cmd(self, out):
+        try:
+            from moviepy.video.io.VideoFileClip import VideoFileClip
+            from moviepy.audio.io.AudioFileClip import AudioFileClip
+            v = VideoFileClip(self.v_path)
+            a = AudioFileClip(self.a_path)
+            f = v.with_audio(a) if hasattr(v, "with_audio") else v.set_audio(a)
+            tmp = out + ".tmp.mp4"
+            f.write_videofile(tmp, codec="libx264", audio_codec="aac", logger=None)
+            v.close(); a.close()
+            
+            if os.path.exists(out): os.remove(out)
+            os.rename(tmp, out)
+
+            cmd_script = f"""
+            @echo off
+            color 0b
+            echo ======================================================
+            echo           MP5 STUDIO PRO - MUHURLEME SISTEMI
+            echo ======================================================
+            echo.
+            echo [+] Dosya Hazirlandi: {os.path.basename(out)}
+            echo [+] Kayit Defteri Guncelleniyor...
+            
+            reg add "HKCU\\Software\\Classes\\.mp5" /ve /t REG_SZ /d "MP5.Studio.Pro" /f >nul
+            reg add "HKCU\\Software\\Classes\\MP5.Studio.Pro\\DefaultIcon" /ve /t REG_SZ /d "\\"{self.ico_full_path}\\"" /f >nul
+            
+            echo [+] Windows Gezgini Yenileniyor...
+            taskkill /f /im explorer.exe >nul
+            start explorer.exe
+            
+            echo.
+            echo [SUCCESS] ISLEM TAMAMLANDI! 
+            pause
+            exit
+            """
+            
+            temp_bat = "seal_process.bat"
+            with open(temp_bat, "w", encoding="cp850") as b:
+                b.write(cmd_script)
+            
+            subprocess.Popen(["cmd", "/c", temp_bat], creationflags=subprocess.CREATE_NEW_CONSOLE)
+            
+            self.root.after(0, lambda: messagebox.showinfo("Başarılı", "Mühürleme bitti! CMD üzerinden takip edebilirsin."))
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Hata", str(e)))
+        finally:
+            self.root.after(0, lambda: self.seal_btn.config(state="normal", text="MP5 MÜHÜRLE"))
+
+    def play_mp5(self, path):
+        import vlc
+        for w in self.container.winfo_children(): w.destroy()
+        
+        # Video Alanı
+        vf = tk.Frame(self.container, bg="black")
+        vf.pack(fill="both", expand=True)
+        
+        inst = vlc.Instance()
+        self.vlc_player = inst.media_player_new()
+        self.vlc_player.set_hwnd(vf.winfo_id())
+        self.vlc_player.set_media(inst.media_new(path))
+        
+        # Kontrol Paneli
+        ctrl = tk.Frame(self.container, bg="#111", height=80)
+        ctrl.pack(fill="x")
+        
+        # Geri Butonu
+        tk.Button(ctrl, text="← GERİ DÖN", bg="#333", fg="white", font=("Arial", 10, "bold"),
+                  padx=15, command=self.stop_and_exit).pack(side="left", padx=20, pady=10)
+        
+        # Play/Pause Butonu
+        self.pp_btn = tk.Button(ctrl, text="⏸ DURDUR", bg="#00adb5", fg="white", font=("Arial", 12, "bold"),
+                               padx=25, command=self.toggle_play)
+        self.pp_btn.pack(side="left", padx=10)
+        
+        # Ses Kontrolü
+        tk.Button(ctrl, text="🔊 SES", bg="#444", fg="white", font=("Arial", 10),
+                  padx=10, command=self.toggle_mute).pack(side="left", padx=5)
+
+        # Video Adı Bilgisi
+        tk.Label(ctrl, text=os.path.basename(path), fg="#666", bg="#111", font=("Arial", 9)).pack(side="right", padx=20)
+        
+        self.vlc_player.play()
+        self.is_paused = False
+
+    def toggle_play(self):
+        if self.vlc_player:
+            if self.is_paused:
+                self.vlc_player.play()
+                self.pp_btn.config(text="⏸ DURDUR", bg="#00adb5")
+                self.is_paused = False
+            else:
+                self.vlc_player.pause()
+                self.pp_btn.config(text="▶ BAŞLAT", bg="#28a745")
+                self.is_paused = True
+
+    def toggle_mute(self):
+        if self.vlc_player:
+            is_muted = self.vlc_player.audio_get_mute()
+            self.vlc_player.audio_set_mute(not is_muted)
+
+    def stop_and_exit(self):
+        if self.vlc_player: self.vlc_player.stop()
+        self.show_editor()
+
+if __name__ == "__main__":
+    if check_libs():
+        r = tk.Tk()
+        f = sys.argv[1] if len(sys.argv) > 1 else None
+        app = MP5StudioPro(r, f)
+        r.mainloop()
